@@ -1,0 +1,362 @@
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+import math
+from ortools.constraint_solver import routing_enums_pb2
+from ortools.constraint_solver import pywrapcp
+import requests
+import numpy as np
+# Excel dosyasını okuma
+excel_file = 'Örnek_Liste.xlsx'
+df_arac = pd.read_excel(excel_file, sheet_name=1)
+df_arac = df_arac.fillna(0)
+df_arac['RTT'] = pd.to_datetime(df_arac['RTT'])
+
+df_tir = pd.read_excel(excel_file, sheet_name=2)
+df_tir['Araç Hacmi'] = df_tir['Araç Hacmi'].astype(float)
+df_tir['RTT'] = pd.to_datetime(df_tir['RTT'])
+
+# Grafiği oluşturma
+G = nx.Graph()
+
+# Önemli ve önemsiz yükleri ayırma
+important_loads = df_arac[df_arac['Durum'] == 'Özel Üretim']
+normal_loads = df_arac[df_arac['Durum'] == 0]
+
+# Tarihlere göre sıralama
+grouped_important_loads = important_loads.groupby('RTT')
+
+# Tırları sıralama
+trucks = list(df_tir['Araç Kodu'])
+initial_truck_count = len(trucks)
+
+# Tırların hacim ve tarih bilgilerini sözlüğe alma
+truck_volumes = {truck: float(df_tir[df_tir['Araç Kodu'] == truck]['Araç Hacmi'].values[0]) for truck in trucks}
+truck_dates = {truck: df_tir[df_tir['Araç Kodu'] == truck]['RTT'].values[0] for truck in trucks}
+
+# Özel Durum yüklerini tırlara dağıtma
+truck_index = 0
+assigned_trucks = set()
+
+for load_date, loads in grouped_important_loads:
+    for idx, row in loads.iterrows():
+        load = f"Load_{row['Müşteri Kodu']}"
+
+        # Özel Durum yükü için tır seçimi
+        tries = 0
+        while ( trucks[truck_index] in assigned_trucks or truck_dates[trucks[truck_index]]!= load_date) and tries < len(trucks):
+            truck_index = (truck_index + 1) % len(trucks)
+            tries += 1
+
+        if tries == len(trucks):
+            # Uygun tır bulunamazsa bir sonraki günde uygun tır arama
+            next_date = load_date + pd.DateOffset(days=1)
+            next_day_tries = 0
+            while next_day_tries < len(trucks):
+                next_truck_index = (next_day_tries) % len(trucks)
+                if truck_volumes[trucks[next_truck_index]] >= row['Müşteri Kodu Toplam Hacim'] and trucks[next_truck_index] not in assigned_trucks and truck_dates[next_truck_index]== next_date :
+                    
+                    truck = trucks[next_truck_index]
+                    G.add_node(load, type='load', volume=row['Müşteri Kodu Toplam Hacim'], date=load_date,pos=row['Adres'],customer_code=row['Müşteri Kodu'])
+                    G.add_node(truck, type='truck', date=next_date)
+                    G.add_edge(load, truck)
+                    truck_volumes[truck] -= row['Müşteri Kodu Toplam Hacim']
+                    assigned_trucks.add(truck)
+
+                    available_volume=truck_volumes[trucks[truck]]
+                    small_loads=normal_loads[(normal_loads['Müşteri Kodu Toplam Hacim'] <= available_volume) & (normal_loads['RTT'] == next_date)].sort_values(by='Müşteri Kodu Toplam Hacim').head(2)
+                    for idx3,row3 in small_loads.iterrows():
+                        load3=f"Load_{row3['Müşteri Kodu']}_{next_date.date()}"
+                        G.add_node(load3,type='load',volume=row3['Müşteri Kodu Toplam Hacim'],date=truck_dates[truck],pos=row3['Adres'],customer_code=row3['Müşteri Kodu'])
+                        G.add_edge(load3,truck)
+                        truck_volumes[truck]-=row3['Müşteri Kodu Toplam Hacim']
+                    
+                normal_loads=normal_loads.drop(small_loads.index)
+                break
+            next_day_tries += 1
+                    
+            if next_day_tries==len(trucks):
+                # Yeni tır ekleme
+                new_truck = f"Extra_Truck_{len(trucks) - initial_truck_count + 1}"
+                trucks.append(new_truck)
+                truck_volumes[new_truck] = df_tir['Araç Hacmi'].mean()  # Yeni tır için ortalama hacim
+                truck_dates[new_truck] = load_date
+                truck = new_truck
+                G.add_node(load, type='load', volume=row['Müşteri Kodu Toplam Hacim'], date=load_date,pos=row['Adres'],customer_code=row['Müşteri Kodu'])
+                G.add_node(truck, type='truck', date=load_date)
+                G.add_edge(load, truck)
+                truck_volumes[truck] -= row['Müşteri Kodu Toplam Hacim']
+                assigned_trucks.add(truck)
+        else:
+            truck = trucks[truck_index]
+            G.add_node(load, type='load', volume=row['Müşteri Kodu Toplam Hacim'], date=load_date,pos=row['Adres'],customer_code=row['Müşteri Kodu'])
+            G.add_node(truck, type='truck', date=load_date)
+            G.add_edge(load, truck)
+            truck_volumes[truck] -= row['Müşteri Kodu Toplam Hacim']
+            assigned_trucks.add(truck)  # Tırı atananlar listesine ekle
+
+            # Yanına iki farklı en küçük hacimde ürün ekleme
+            available_volume = truck_volumes[truck]
+            small_loads = normal_loads[(normal_loads['Müşteri Kodu Toplam Hacim'] <= available_volume) & (normal_loads['RTT'] == load_date)].sort_values(by='Müşteri Kodu Toplam Hacim').head(2)
+
+            for idx2, row2 in small_loads.iterrows():
+                load2 = f"Load_{row2['Müşteri Kodu']}"
+                G.add_node(load2, type='load', volume=row2['Müşteri Kodu Toplam Hacim'], date=row2['RTT'],pos=row2['Adres'],customer_code=row2['Müşteri Kodu'])
+                G.add_edge(load2, truck)
+                truck_volumes[truck] -= row2['Müşteri Kodu Toplam Hacim']
+
+            normal_loads = normal_loads.drop(small_loads.index)
+
+
+grouped_normal_loads = normal_loads.groupby('RTT')
+# Normal yükleri tırlara tarih bazlı atama
+for load_date, loads in grouped_normal_loads:
+    for idx, row in loads.iterrows():
+        load = f"Load_{row['Müşteri Kodu']}"
+
+        # Tırların hacimlerini kontrol ederek yük atama
+        truck_assigned = False
+        for truck in trucks:
+            next_day = load_date + pd.DateOffset(days=1)
+            if truck_volumes[truck] >= row['Müşteri Kodu Toplam Hacim'] and truck_dates[truck] == load_date and truck not in assigned_trucks:
+                G.add_node(load, type='load', volume=row['Müşteri Kodu Toplam Hacim'], date=load_date,pos=row['Adres'],customer_code=row['Müşteri Kodu'])
+                G.add_node(truck, type='truck', date=load_date)
+                G.add_edge(load, truck)
+                truck_volumes[truck] -= row['Müşteri Kodu Toplam Hacim']
+                truck_assigned = True
+                break
+            # Eğer uygun bir tır bulunamazsa bir sonraki günü kontrol et 
+            elif truck_volumes[truck] >= row['Müşteri Kodu Toplam Hacim'] and truck_dates[truck] >= next_day and truck not in assigned_trucks:
+                G.add_node(load, type='load', volume=row['Müşteri Kodu Toplam Hacim'], date=load_date,pos=row['Adres'],customer_code=row['Müşteri Kodu'])
+                G.add_node(truck, type='truck', date=next_day)
+                G.add_edge(load, truck)
+                truck_volumes[truck] -= row['Müşteri Kodu Toplam Hacim']
+                truck_assigned = True
+                break
+
+        # Eğer uygun tır bulunamazsa yeni bir tır ekle
+        if not truck_assigned:
+            new_truck = f"Extra_Truck_{len(trucks) - initial_truck_count + 1}"
+            trucks.append(new_truck)
+            truck_volumes[new_truck] = 100  # Yeni tır için ortalama hacim
+            truck_dates[new_truck] = load_date
+            G.add_node(load, type='load', volume=row['Müşteri Kodu Toplam Hacim'], date=load_date,pos=row['Adres'],customer_code=row['Müşteri Kodu'])
+            G.add_node(new_truck, type='truck', date=load_date)
+            G.add_edge(load, new_truck)
+            truck_volumes[new_truck] -= row['Müşteri Kodu Toplam Hacim']
+
+# Sonuç tablosunu oluşturma
+results = []
+truck_index_data={}
+for truck in trucks:
+    truck_loads = [node for node in G.nodes if G.nodes[node]['type'] == 'load' and any(neighbor == truck for neighbor in G.neighbors(node))]
+    for load in truck_loads:
+        load_info = G.nodes[load]
+      
+        
+        results.append({
+            'Truck': truck,
+            'Load': load,
+            'Load Volume': load_info['volume'],
+            'Load Date': load_info['date'],
+            'Truck Date': G.nodes[truck]['date'],
+            'Remaining Truck Volume': truck_volumes[truck],
+            'Adres':G.nodes[load]['pos'],
+        })
+results_df = pd.DataFrame(results)
+results_df = results_df.sort_values(by=['Truck', 'Load Date'])
+
+# Sonuçları Excel dosyasına yazma
+results_df.to_excel('Araç_Yükleme_Sonuç.xlsx', index=False)
+
+# Yüklerin hangi tıra atandığını içeren bir sütunu orijinal Excel dosyasına ekleme
+df_arac['Assigned Truck'] = ''
+for idx, row in results_df.iterrows():
+    load_id = row['Load'].split('_')[1]  # Müşteri Kodu'nu kullanarak yük ID'sini al
+    df_arac.loc[df_arac['Müşteri Kodu'] == load_id, 'Assigned Truck'] = row['Truck']
+    df_arac.to_excel('Araç_Yükleme_Güncellenmiş.xlsx')
+
+print("Sonuçlar Excel dosyasına yazıldı.")
+
+# Grafiği kontrol etme
+#print("Düğümler:", G.nodes(data=True))
+#print("Kenarlar:", G.edges(data=True))
+
+# Grafiği görselleştirme
+#node_colors = ['skyblue' if G.nodes[node]['type'] == 'load' else 'lightgreen' for node in G.nodes]
+#pos = nx.spring_layout(G)
+#nx.draw(G, pos, with_labels=True, node_color=node_colors, node_size=700, edge_color='k', font_size=10, font_color='black')
+#plt.show()
+
+import gmaps
+
+
+
+
+import googlemaps
+import pandas as pd
+import requests
+
+API_KEY = ''
+gmaps = googlemaps.Client(key=API_KEY)
+
+df=pd.DataFrame(results)
+
+import gmplot
+
+# Add nodes and edges to the graph
+for i, row in df.iterrows():
+    G.add_node(f"Load_{row['Load']}", pos=row['Adres'], type='load')
+
+trucks = list(df['Truck'].unique())
+for truck in trucks:
+    G.add_node(truck, pos=(41.0122, 28.976), type='truck')  # Central position for trucks
+
+# Update node positions using Google Maps API
+for node in G.nodes:
+    if G.nodes[node]['type'] == 'load':
+        location = gmaps.geocode(G.nodes[node]['pos'])[0]['geometry']['location']
+        G.nodes[node]['pos'] = (location['lat'], location['lng'])
+    elif G.nodes[node]['type'] == 'truck':
+        G.nodes[node]['pos'] = (41.0122, 28.976)  # Central position for trucks
+
+# Add lat and lng columns to df
+df['lat'] = df['Load'].apply(lambda x: G.nodes[f"Load_{x}"]['pos'][0] if f"Load_{x}" in G.nodes else None)
+df['lng'] = df['Load'].apply(lambda x: G.nodes[f"Load_{x}"]['pos'][1] if f"Load_{x}" in G.nodes else None)
+
+# Function to create the distance matrix
+def create_distance_matrix(truck):
+    truck_loads = df[df['Truck'] == truck]['Load']
+    truck_load_positions = [G.nodes[f"Load_{load}"]['pos'] for load in truck_loads]
+
+    num_loads = len(truck_load_positions)
+    dist_matrix = np.zeros((num_loads + 1, num_loads + 1))  # +1 for the depot
+
+    depot_position = (41.0122, 28.976)  # Central depot position
+
+    # Calculate distances from depot to all loads and vice versa
+    for i, pos1 in enumerate([depot_position] + truck_load_positions):
+        for j, pos2 in enumerate([depot_position] + truck_load_positions):
+            if i != j:
+                distance = gmaps.distance_matrix(pos1, pos2, mode='driving')['rows'][0]['elements'][0]['distance']['value']
+                dist_matrix[i][j] = distance
+    return dist_matrix
+
+# OR-Tools for routing and optimization
+def create_data_model(truck):
+    data = {}
+    data['distance_matrix'] = create_distance_matrix(truck)
+    data['num_vehicles'] = 1  # Assuming one truck per optimization run
+    data['depot'] = 0
+    return data
+
+def plot_on_google_maps(truck, solution, data, manager, routing):
+    truck_loads = df[df['Truck'] == truck]['Load']
+    truck_load_positions = [G.nodes[f"Load_{load}"]['pos'] for load in truck_loads]
+
+    depot_position = (41.0122, 28.976)  # Central depot position
+
+    gmap = gmplot.GoogleMapPlotter(depot_position[0], depot_position[1], 10)
+
+    latitudes = [depot_position[0]]
+    longitudes = [depot_position[1]]
+
+    for vehicle_id in range(data['num_vehicles']):
+        index = routing.Start(vehicle_id)
+        while not routing.IsEnd(index):
+            node_index = manager.IndexToNode(index)
+            if node_index > 0:  # skip depot
+                pos = truck_load_positions[node_index - 1]
+                latitudes.append(pos[0])
+                longitudes.append(pos[1])
+            index = solution.Value(routing.NextVar(index))
+        latitudes.append(depot_position[0])
+        longitudes.append(depot_position[1])
+
+    gmap.plot(latitudes, longitudes, 'cornflowerblue', edge_width=2.5)
+
+    for pos in truck_load_positions:
+        gmap.marker(pos[0], pos[1], 'red')
+
+    gmap.draw("map.html")
+    print("Map has been created and saved as map.html")
+
+for truck in trucks:
+    data = create_data_model(truck)
+    manager = pywrapcp.RoutingIndexManager(len(data['distance_matrix']), data['num_vehicles'], data['depot'])
+    routing = pywrapcp.RoutingModel(manager)
+
+    def distance_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return data['distance_matrix'][from_node][to_node]
+
+    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters.first_solution_strategy = (routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+
+    solution = routing.SolveWithParameters(search_parameters)
+
+    # Solution visualization
+    def print_solution(manager, routing, solution, truck):
+        route_distance = 0
+        df_list = df[df['Truck'] == truck]['Load'].tolist()
+        plan_output = f'Route for {truck}:\n'
+        index = routing.Start(0)
+        while not routing.IsEnd(index):
+            node_index = manager.IndexToNode(index)
+            node = "Depot" if node_index == 0 else df_list[node_index - 1]  # Adjust index for depot
+            plan_output += f' {node} ->'
+            previous_index = index
+            index = solution.Value(routing.NextVar(index))
+            if index == 0:  # End of route
+                break
+            route_distance += data['distance_matrix'][manager.IndexToNode(previous_index)][manager.IndexToNode(index)] / 1000
+        plan_output += f' Depot\n'
+        print(plan_output)
+        print(f'Route distance for {truck}: {route_distance:.2f} km')
+
+    if solution:
+        print_solution(manager, routing, solution, truck)
+        plot_on_google_maps(truck, solution, data, manager, routing)
+        
+    # Draw the graph with the solution
+    def draw_graph(G, solution, truck):
+        pos = nx.get_node_attributes(G, 'pos')
+        labels = {node: node for node in G.nodes()}
+
+        load_nodes = [node for node in G.nodes() if G.nodes[node]['type'] == 'load']
+        truck_nodes = [node for node in G.nodes() if G.nodes[node]['type'] == 'truck']
+
+        plt.figure(figsize=(15, 10))
+
+        load_pos = [pos[node] for node in load_nodes if isinstance(pos[node], tuple) and len(pos[node]) == 2]
+        truck_pos = [pos[node] for node in truck_nodes if isinstance(pos[node], tuple) and len(pos[node]) == 2]
+
+        if load_pos:
+            nx.draw_networkx_nodes(G, pos, nodelist=load_nodes, node_color='blue', node_size=50, alpha=0.6)
+        if truck_pos:
+            nx.draw_networkx_nodes(G, pos, nodelist=truck_nodes, node_color='red', node_size=100, alpha=0.6)
+
+        nx.draw_networkx_labels(G, pos, labels, font_size=8)
+        nx.draw_networkx_edges(G, pos, edgelist=G.edges(), alpha=0.3)
+        if solution:
+            for vehicle_id in range(data['num_vehicles']):
+                index = routing.Start(vehicle_id)
+                while not routing.IsEnd(index):
+                    from_index = manager.IndexToNode(index)
+                    index = solution.Value(routing.NextVar(index))
+                    to_index = manager.IndexToNode(index)
+                    if from_index != to_index:
+                        from_node = list(G.nodes)[from_index]
+                        to_node = list(G.nodes)[to_index]
+                        if from_node in pos and to_node in pos:
+                            nx.draw_networkx_edges(G, pos, edgelist=[(from_node, to_node)], edge_color='green', width=5, alpha=0.7)
+
+        plt.title(f"Vehicle Routing Problem Solution for {truck}")
+        plt.show()
+
+    if solution:
+        draw_graph(G, solution, truck)
